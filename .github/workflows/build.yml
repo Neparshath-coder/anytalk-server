@@ -39,6 +39,14 @@ jobs:
       - name: Checkout this repo
         uses: actions/checkout@v4
 
+      # Compiling the whole backend needs more disk than the runner has free;
+      # drop preinstalled toolchains we don't use (several GB each)
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force
+          df -h /
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -116,6 +124,10 @@ jobs:
           push: true
           platforms: linux/amd64
           tags: ghcr.io/${{ steps.v.outputs.owner }}/anytalk-server-base:${{ steps.v.outputs.tag }}-anytalk
+          # Upstream defaults to 10 parallel jobs, which runs the 4-core /
+          # 16 GB runner out of memory and gets it shut down
+          build-args: |
+            CARGO_BUILD_JOBS=3
           cache-from: type=gha,scope=base
           cache-to: type=gha,scope=base,mode=max
 
