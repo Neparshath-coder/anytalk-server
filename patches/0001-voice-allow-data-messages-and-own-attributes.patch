@@ -1,0 +1,31 @@
+diff --git a/crates/core/database/src/voice/mod.rs b/crates/core/database/src/voice/mod.rs
+index 836de92a..694ff06a 100644
+--- a/crates/core/database/src/voice/mod.rs
++++ b/crates/core/database/src/voice/mod.rs
+@@ -534,7 +534,10 @@ pub async fn sync_user_voice_permissions(
+                 ParticipantPermission {
+                     can_subscribe: can_listen,
+                     can_publish: can_speak,
+-                    can_publish_data: can_speak,
++                    // AnyTalk: keep data messages for everyone who can join and
++                    // keep own attribute updates (e.g. deafen state) for listen-only users
++                    can_publish_data: true,
++                    can_update_metadata: true,
+                     ..Default::default()
+                 },
+             )
+diff --git a/crates/core/database/src/voice/voice_client.rs b/crates/core/database/src/voice/voice_client.rs
+index a82b6037..a2d09c52 100644
+--- a/crates/core/database/src/voice/voice_client.rs
++++ b/crates/core/database/src/voice/voice_client.rs
+@@ -87,7 +87,9 @@ impl VoiceClient {
+             .with_grants(VideoGrants {
+                 room_join: true,
+                 can_publish: true,
+-                can_publish_data: false,
++                // AnyTalk: allow data messages and own attribute/metadata updates
++                can_publish_data: true,
++                can_update_own_metadata: true,
+                 can_publish_sources: allowed_sources
+                     .into_iter()
+                     .map(ToString::to_string)

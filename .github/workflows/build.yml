@@ -1,0 +1,146 @@
+name: Build patched Stoat server
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Upstream stoatchat/stoatchat tag to build (e.g. v0.15.7). Empty = latest release."
+        required: false
+        type: string
+      force:
+        description: "Rebuild even if the image tag already exists"
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    - cron: "17 4 * * *"
+  push:
+    branches: [main]
+    paths:
+      - "patches/**"
+      - ".github/workflows/build.yml"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-server
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: stoatchat/stoatchat
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Pick the upstream tag and decide whether anything needs building.
+      - name: Resolve version
+        id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_FORCE: ${{ inputs.force }}
+          EVENT: ${{ github.event_name }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          owner="${OWNER,,}"
+          tag="$INPUT_VERSION"
+          if [ -z "$tag" ]; then
+            tag="$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)"
+          fi
+          echo "Upstream tag: $tag"
+          image="ghcr.io/$owner/anytalk-server-api:$tag-anytalk"
+          build=true
+          # Scheduled runs and manual runs without "force" skip when the image
+          # already exists. Pushes always build (the patch changed).
+          if [ "$EVENT" = "schedule" ] || { [ "$EVENT" = "workflow_dispatch" ] && [ "$INPUT_FORCE" != "true" ]; }; then
+            if docker buildx imagetools inspect "$image" >/dev/null 2>&1; then
+              echo "$image already exists, nothing to do."
+              build=false
+            fi
+          fi
+          {
+            echo "tag=$tag"
+            echo "owner=$owner"
+            echo "build=$build"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Clone upstream at tag
+        if: steps.v.outputs.build == 'true'
+        run: git clone --depth 1 --branch "${{ steps.v.outputs.tag }}" "https://github.com/$UPSTREAM.git" upstream
+
+      # Fails the job if a patch no longer applies.
+      - name: Apply patches
+        if: steps.v.outputs.build == 'true'
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          for p in ../patches/*.patch; do
+            echo "Applying $p"
+            git apply --check "$p"
+            git apply "$p"
+          done
+          git diff --stat
+
+      - name: Docker metadata (labels)
+        if: steps.v.outputs.build == 'true'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ steps.v.outputs.owner }}/anytalk-server-api
+
+      # Compiles the whole workspace. Pushed to GHCR so the service build
+      # (a separate buildx invocation) can pull it as its base.
+      - name: Build and push base image
+        if: steps.v.outputs.build == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: upstream
+          push: true
+          platforms: linux/amd64
+          tags: ghcr.io/${{ steps.v.outputs.owner }}/anytalk-server-base:${{ steps.v.outputs.tag }}-anytalk
+          cache-from: type=gha,scope=base
+          cache-to: type=gha,scope=base,mode=max
+
+      # The upstream service Dockerfile has a hardcoded
+      # "FROM ghcr.io/stoatchat/base:latest"; point it at our base.
+      - name: Point service Dockerfile at our base image
+        if: steps.v.outputs.build == 'true'
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          sed -i "s#^FROM ghcr.io/stoatchat/base:latest#FROM ghcr.io/${{ steps.v.outputs.owner }}/anytalk-server-base:${{ steps.v.outputs.tag }}-anytalk#" crates/delta/Dockerfile
+          grep -n '^FROM' crates/delta/Dockerfile
+          grep -q 'anytalk-server-base' crates/delta/Dockerfile
+
+      - name: Build and push api image
+        if: steps.v.outputs.build == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: upstream
+          file: upstream/crates/delta/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ghcr.io/${{ steps.v.outputs.owner }}/anytalk-server-api:${{ steps.v.outputs.tag }}-anytalk
+            ghcr.io/${{ steps.v.outputs.owner }}/anytalk-server-api:latest
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,scope=api,mode=max
