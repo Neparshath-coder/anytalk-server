@@ -1,0 +1,66 @@
+diff --git a/crates/core/database/src/voice/mod.rs b/crates/core/database/src/voice/mod.rs
+index 694ff06..a329106 100644
+--- a/crates/core/database/src/voice/mod.rs
++++ b/crates/core/database/src/voice/mod.rs
+@@ -7,7 +7,7 @@ use crate::{
+     Database, Server,
+ };
+ use iso8601_timestamp::{Duration, Timestamp};
+-use livekit_protocol::ParticipantPermission;
++use livekit_protocol::{ParticipantPermission, TrackSource};
+ use redis_kiss::{
+     get_connection as _get_connection,
+     redis::{FromRedisValue, Pipeline, RedisError, RedisWrite, ToRedisArgs, Value},
+@@ -520,6 +520,20 @@ pub async fn sync_user_voice_permissions(
+         let can_speak = permissions.has_channel_permission(ChannelPermission::Speak);
+         let can_listen = permissions.has_channel_permission(ChannelPermission::Listen);
+ 
++        // AnyTalk: an empty can_publish_sources means "all sources" to LiveKit, so
++        // send the same sources the join token allows (see create_token)
++        let sources = get_allowed_sources(&limits, permissions);
++        let can_publish_sources = sources
++            .iter()
++            .filter_map(|source| match *source {
++                "microphone" => Some(TrackSource::Microphone as i32),
++                "camera" => Some(TrackSource::Camera as i32),
++                "screen_share" => Some(TrackSource::ScreenShare as i32),
++                "screen_share_audio" => Some(TrackSource::ScreenShareAudio as i32),
++                _ => None,
++            })
++            .collect::<Vec<_>>();
++
+         update_event.camera = voice_state.camera.then_some(can_video);
+         update_event.screensharing = voice_state.screensharing.then_some(can_video);
+         update_event.is_publishing = voice_state.is_publishing.then_some(can_speak);
+@@ -533,7 +547,8 @@ pub async fn sync_user_voice_permissions(
+                 channel_id,
+                 ParticipantPermission {
+                     can_subscribe: can_listen,
+-                    can_publish: can_speak,
++                    can_publish: !sources.is_empty(),
++                    can_publish_sources,
+                     // AnyTalk: keep data messages for everyone who can join and
+                     // keep own attribute updates (e.g. deafen state) for listen-only users
+                     can_publish_data: true,
+diff --git a/crates/delta/src/routes/servers/member_edit.rs b/crates/delta/src/routes/servers/member_edit.rs
+index 7040036..2ef537e 100644
+--- a/crates/delta/src/routes/servers/member_edit.rs
++++ b/crates/delta/src/routes/servers/member_edit.rs
+@@ -303,7 +303,7 @@ pub async fn edit(
+                 db,
+                 voice_client,
+                 &node,
+-                &user,
++                &target_user,
+                 &channel,
+                 Some(&server),
+                 None,
+@@ -317,7 +317,7 @@ pub async fn edit(
+         {
+             let node = get_channel_node(&channel).await?.unwrap();
+ 
+-            voice_client.remove_user(&node, &user.id, &channel).await?;
++            voice_client.remove_user(&node, &target_user.id, &channel).await?;
+         };
+     }
+ 

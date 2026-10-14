@@ -11,6 +11,11 @@ Builds a patched Stoat backend (`stoatchat/stoatchat`) for AnyTalk. Nothing here
 
 Why: the AnyTalk client sends LiveKit data messages (topic `anytalk:watching`, stream viewers) and calls `setAttributes({ deafened })`. Stock Stoat rejects both. Both are set to true for everyone, including listen-only users, so the deafen state still works for them. Upstream tied data publishing to the speak permission, which we no longer do.
 
+`patches/0002-voice-resync-publish-sources-and-target-user.patch` (security fixes, applies on top of 0001):
+
+- `voice/mod.rs`: the permission re-sync during a call now sends `can_publish_sources` (the same list the join token uses, via `get_allowed_sources`) and `can_publish` only when that list is non-empty. Before, an empty list meant "all sources" to LiveKit, so a member without the Video permission could publish camera and screen share after any role edit mid-call.
+- `crates/delta/src/routes/servers/member_edit.rs`: the re-sync after a server mute/deafen change now uses the edited member instead of the moderator, so the change reaches LiveKit. Removing a member from the voice channel (`FieldsMember::VoiceChannel`) now also removes the edited member, not the moderator.
+
 Only the `api` service (`crates/delta`) creates tokens and updates participant permissions. `voice-ingress`, `events` and the others don't, so **only the api image needs replacing**.
 
 ## Images
