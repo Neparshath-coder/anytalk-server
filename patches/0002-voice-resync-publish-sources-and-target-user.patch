@@ -43,24 +43,24 @@ index 694ff06..a329106 100644
                      // keep own attribute updates (e.g. deafen state) for listen-only users
                      can_publish_data: true,
 diff --git a/crates/delta/src/routes/servers/member_edit.rs b/crates/delta/src/routes/servers/member_edit.rs
-index 7040036..2ef537e 100644
+index 7d0fc40..392f113 100644
 --- a/crates/delta/src/routes/servers/member_edit.rs
 +++ b/crates/delta/src/routes/servers/member_edit.rs
-@@ -303,7 +303,7 @@ pub async fn edit(
-                 db,
-                 voice_client,
-                 &node,
--                &user,
-+                &target_user,
-                 &channel,
-                 Some(&server),
-                 None,
-@@ -317,7 +317,7 @@ pub async fn edit(
-         {
-             let node = get_channel_node(&channel).await?.unwrap();
+@@ -308,7 +308,7 @@ pub async fn edit(
+             db,
+             voice_client,
+             &node,
+-            &user,
++            &target_user,
+             &channel,
+             Some(&server),
+             None,
+@@ -321,7 +321,7 @@ pub async fn edit(
+     {
+         let node = get_channel_node(&channel).await?.unwrap();
  
--            voice_client.remove_user(&node, &user.id, &channel).await?;
-+            voice_client.remove_user(&node, &target_user.id, &channel).await?;
-         };
-     }
+-        voice_client.remove_user(&node, &user.id, &channel).await?;
++        voice_client.remove_user(&node, &target_user.id, &channel).await?;
+     };
  
+     Ok(Json(member.into()))
