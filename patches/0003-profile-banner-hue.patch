@@ -1,0 +1,138 @@
+diff --git a/crates/core/database/src/models/users/model.rs b/crates/core/database/src/models/users/model.rs
+index bda1b21..2a102b9 100644
+--- a/crates/core/database/src/models/users/model.rs
++++ b/crates/core/database/src/models/users/model.rs
+@@ -78,6 +78,7 @@ auto_derived!(
+         StatusPresence,
+         ProfileContent,
+         ProfileBackground,
++        ProfileBannerHue,
+         DisplayName,
+         Pronouns,
+ 
+@@ -138,6 +139,9 @@ auto_derived!(
+         /// Background visible on user's profile
+         #[serde(skip_serializing_if = "Option::is_none")]
+         pub background: Option<File>,
++        /// Hue (0-359) of the banner colour shown when there is no background
++        #[serde(skip_serializing_if = "Option::is_none")]
++        pub banner_hue: Option<u16>,
+     }
+ 
+     /// Bot information for if the user is a bot
+@@ -723,6 +727,11 @@ impl User {
+                     x.background = None;
+                 }
+             }
++            FieldsUser::ProfileBannerHue => {
++                if let Some(x) = self.profile.as_mut() {
++                    x.banner_hue = None;
++                }
++            }
+             FieldsUser::DisplayName => self.display_name = None,
+             FieldsUser::Pronouns => self.pronouns = None,
+             FieldsUser::Suspension => self.suspended_until = None,
+@@ -828,6 +837,7 @@ impl User {
+                 FieldsUser::StatusPresence,
+                 FieldsUser::ProfileContent,
+                 FieldsUser::ProfileBackground,
++                FieldsUser::ProfileBannerHue,
+                 FieldsUser::Suspension,
+             ],
+         )
+diff --git a/crates/core/database/src/models/users/ops/mongodb.rs b/crates/core/database/src/models/users/ops/mongodb.rs
+index b2a8eb1..ed1ddd2 100644
+--- a/crates/core/database/src/models/users/ops/mongodb.rs
++++ b/crates/core/database/src/models/users/ops/mongodb.rs
+@@ -332,6 +332,7 @@ impl IntoDocumentPath for FieldsUser {
+         Some(match self {
+             FieldsUser::Avatar => "avatar",
+             FieldsUser::ProfileBackground => "profile.background",
++            FieldsUser::ProfileBannerHue => "profile.banner_hue",
+             FieldsUser::ProfileContent => "profile.content",
+             FieldsUser::StatusPresence => "status.presence",
+             FieldsUser::StatusText => "status.text",
+diff --git a/crates/core/database/src/util/bridge/v0.rs b/crates/core/database/src/util/bridge/v0.rs
+index ff115c4..beab020 100644
+--- a/crates/core/database/src/util/bridge/v0.rs
++++ b/crates/core/database/src/util/bridge/v0.rs
+@@ -1327,6 +1327,7 @@ impl From<FieldsUser> for crate::FieldsUser {
+         match value {
+             FieldsUser::Avatar => crate::FieldsUser::Avatar,
+             FieldsUser::ProfileBackground => crate::FieldsUser::ProfileBackground,
++            FieldsUser::ProfileBannerHue => crate::FieldsUser::ProfileBannerHue,
+             FieldsUser::ProfileContent => crate::FieldsUser::ProfileContent,
+             FieldsUser::StatusPresence => crate::FieldsUser::StatusPresence,
+             FieldsUser::StatusText => crate::FieldsUser::StatusText,
+@@ -1343,6 +1344,7 @@ impl From<crate::FieldsUser> for FieldsUser {
+         match value {
+             crate::FieldsUser::Avatar => FieldsUser::Avatar,
+             crate::FieldsUser::ProfileBackground => FieldsUser::ProfileBackground,
++            crate::FieldsUser::ProfileBannerHue => FieldsUser::ProfileBannerHue,
+             crate::FieldsUser::ProfileContent => FieldsUser::ProfileContent,
+             crate::FieldsUser::StatusPresence => FieldsUser::StatusPresence,
+             crate::FieldsUser::StatusText => FieldsUser::StatusText,
+@@ -1437,6 +1439,7 @@ impl From<crate::UserProfile> for UserProfile {
+         UserProfile {
+             content: value.content,
+             background: value.background.map(|file| file.into()),
++            banner_hue: value.banner_hue,
+         }
+     }
+ }
+@@ -1446,6 +1449,7 @@ impl From<UserProfile> for crate::UserProfile {
+         crate::UserProfile {
+             content: value.content,
+             background: value.background.map(|file| file.into()),
++            banner_hue: value.banner_hue,
+         }
+     }
+ }
+diff --git a/crates/core/models/src/v0/users.rs b/crates/core/models/src/v0/users.rs
+index 217324c..06ffc7d 100644
+--- a/crates/core/models/src/v0/users.rs
++++ b/crates/core/models/src/v0/users.rs
+@@ -91,6 +91,7 @@ auto_derived!(
+         StatusPresence,
+         ProfileContent,
+         ProfileBackground,
++        ProfileBannerHue,
+         DisplayName,
+         Pronouns,
+ 
+@@ -165,6 +166,9 @@ auto_derived!(
+         /// Background visible on user's profile
+         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+         pub background: Option<File>,
++        /// Hue (0-359) of the banner colour shown when there is no background
++        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
++        pub banner_hue: Option<u16>,
+     }
+ 
+     /// User badge bitfield
+@@ -218,6 +222,10 @@ auto_derived!(
+         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+         #[cfg_attr(feature = "validator", validate(length(min = 1, max = 128)))]
+         pub background: Option<String>,
++        /// Hue (0-359) of the banner colour
++        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
++        #[cfg_attr(feature = "validator", validate(range(min = 0, max = 359)))]
++        pub banner_hue: Option<u16>,
+     }
+ 
+     /// New user information
+diff --git a/crates/delta/src/routes/users/edit_user.rs b/crates/delta/src/routes/users/edit_user.rs
+index 1334909..efed9f1 100644
+--- a/crates/delta/src/routes/users/edit_user.rs
++++ b/crates/delta/src/routes/users/edit_user.rs
+@@ -118,6 +118,10 @@ pub async fn edit(
+                 Some(File::use_background(db, &background, &user.id, &user.id).await?);
+         }
+ 
++        if let Some(banner_hue) = profile.banner_hue {
++            new_profile.banner_hue = Some(banner_hue);
++        }
++
+         partial.profile = Some(new_profile);
+     }
+ 
