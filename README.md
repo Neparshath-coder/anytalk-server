@@ -23,6 +23,14 @@ Why: the AnyTalk client sends LiveKit data messages (topic `anytalk:watching`, s
 - New `FieldsUser::ProfileBannerHue` (`"ProfileBannerHue"` in `remove`) clears it (Mongo path `profile.banner_hue`).
 - The hue comes back in `GET /users/{id}/profile`, the edit response and the `UserUpdate` event, like `background`.
 
+`patches/0004-qr-login.patch` (log in a new device by scanning a QR code, applies on top of 0003):
+
+- New file `crates/delta/src/routes/session/qr.rs`, routes registered in `routes/session/mod.rs`. Pending logins live only in Valkey (hash `anytalk:qr:<id>`), expire after 120 s, and are deleted once collected. No Mongo model. At most 1000 pending logins at once (sorted set `anytalk:qr-index`).
+- `POST /auth/session/qr` (no auth) starts a login and returns `id` (goes into the QR), `secret` (only for the new device, stored as SHA-256) and `expires_at`. The friendly name is cleaned (control and bidi characters removed, 64 characters at most). The coarse IP (last part hidden) and User-Agent are stored for the approver.
+- `POST /auth/session/qr/{id}/poll` (no auth, body `{secret}`, constant-time compare) returns `pending`, `scanned`, `denied`, `expired` (also for a wrong secret) or `approved` with the new session, exactly once. Responses are `Cache-Control: no-store`.
+- `POST /auth/session/qr/{id}/info`, `POST .../approve` and `POST .../deny` need a session. `info` marks the request scanned and says which method `approve` needs (`password` or `totp_or_recovery`). `approve` requires the account password (no MFA) or a TOTP/recovery code (MFA), refuses disabled accounts, applies the account lockout, claims the request atomically (Lua scripts) so concurrent approves create one session only, and denies the request after 3 wrong answers. A session that cannot be handed over (request expired meanwhile) is deleted again.
+- `util/ratelimits.rs`: own buckets `auth_qr_start` (5 per 10 s per client IP) and `auth_qr_poll` (20 per 10 s, counted per client IP and per QR id, so polls keep their own budget even when a proxy hides the real IP). The api takes the client IP from `X-Forwarded-For` (`ip_header` in `main.rs`) or `CF-Connecting-IP` (`trust_cloudflare`), so the reverse proxy must set one of them, otherwise all clients share the proxy's IP in the start bucket and in the stored coarse IP. `crates/delta/Cargo.toml` and `Cargo.lock` add `sha2`.
+
 Only the `api` service (`crates/delta`) creates tokens and updates participant permissions. `voice-ingress`, `events` and the others don't, so **only the api image needs replacing**.
 
 ## Images

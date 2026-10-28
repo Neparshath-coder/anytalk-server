@@ -1,0 +1,1041 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 57de805..dfe8daa 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -7614,6 +7614,7 @@ dependencies = [
+  "schemars",
+  "serde",
+  "serde_json",
++ "sha2 0.10.9",
+  "tokio",
+  "ulid",
+  "url",
+diff --git a/crates/delta/Cargo.toml b/crates/delta/Cargo.toml
+index 84bdf4a..300581f 100644
+--- a/crates/delta/Cargo.toml
++++ b/crates/delta/Cargo.toml
+@@ -11,6 +11,7 @@ publish = false
+ [dependencies]
+ # Test
+ rand = { workspace = true }
++sha2 = { workspace = true }
+ redis-kiss = { workspace = true, default-features = false, features = [
+     "tokio-runtime",
+ ] }
+diff --git a/crates/delta/src/routes/session/mod.rs b/crates/delta/src/routes/session/mod.rs
+index 9e11561..e0671b1 100644
+--- a/crates/delta/src/routes/session/mod.rs
++++ b/crates/delta/src/routes/session/mod.rs
+@@ -5,6 +5,7 @@ pub mod edit;
+ pub mod fetch_all;
+ pub mod login;
+ pub mod logout;
++pub mod qr;
+ pub mod revoke;
+ pub mod revoke_all;
+ 
+@@ -15,6 +16,11 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
+         fetch_all::fetch_all,
+         revoke::revoke,
+         revoke_all::revoke_all,
+-        edit::edit
++        edit::edit,
++        qr::start,
++        qr::poll,
++        qr::info,
++        qr::approve,
++        qr::deny
+     ]
+ }
+diff --git a/crates/delta/src/routes/session/qr.rs b/crates/delta/src/routes/session/qr.rs
+new file mode 100644
+index 0000000..c25db0f
+--- /dev/null
++++ b/crates/delta/src/routes/session/qr.rs
+@@ -0,0 +1,955 @@
++//! Log in a new device by scanning a QR code with an already logged-in one
++//!
++//! POST /session/qr, POST /session/qr/<id>/poll, POST /session/qr/<id>/info,
++//! POST /session/qr/<id>/approve, POST /session/qr/<id>/deny
++//!
++//! Pending logins live only in Valkey (`anytalk:qr:<id>`, a hash) and expire
++//! on their own after `QR_TTL_SECS`. The `id` is shown in the QR code. The
++//! `secret` never leaves the new device (only its SHA-256 is stored), so
++//! somebody who sees the QR code cannot collect the session.
++use std::net::IpAddr;
++
++use iso8601_timestamp::{Duration, Timestamp};
++use redis_kiss::{AsyncCommands, Conn, get_connection, redis};
++use revolt_database::{Account, Database, Session, util::ip::rocket::to_real_ip};
++use revolt_models::v0;
++use revolt_result::{Error, Result, ToRevoltError, create_error};
++use revolt_rocket_okapi::{
++    OpenApiError,
++    r#gen::OpenApiGenerator,
++    request::{OpenApiFromRequest, RequestHeaderInput},
++    response::OpenApiResponderInner,
++    revolt_okapi::openapi3::Responses,
++};
++use rocket::{
++    State,
++    http::Header,
++    request::{FromRequest, Outcome, Request},
++    response::{self, Responder},
++    serde::json::Json,
++};
++use schemars::JsonSchema;
++use serde::{Deserialize, Serialize};
++use sha2::{Digest, Sha256};
++
++/// How long a pending QR login can be approved, in seconds
++const QR_TTL_SECS: i64 = 120;
++
++/// How long the new device has to collect the result once it is decided
++const QR_RESULT_TTL_SECS: i64 = 60;
++
++/// Wrong MFA codes or passwords allowed before the pending login is denied
++const QR_MAX_ATTEMPTS: i64 = 3;
++
++/// How many pending logins may exist at once, so `start` cannot fill Valkey
++const QR_MAX_PENDING: i64 = 1000;
++
++/// Longest friendly name kept, in characters
++const QR_MAX_NAME_CHARS: usize = 64;
++
++/// Longest User-Agent kept, in characters
++const QR_MAX_AGENT_CHARS: usize = 200;
++
++/// Length of a pending login id (a nanoid)
++const QR_ID_LEN: usize = 32;
++
++/// Valkey sorted set of pending ids scored by expiry time, for the global cap
++const QR_INDEX_KEY: &str = "anytalk:qr-index";
++
++/// Create the entry unless the cap is reached
++/// KEYS: entry, index. ARGV: now, cap, ttl, id, then field/value pairs.
++const SCRIPT_START: &str = r#"
++redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', ARGV[1])
++if redis.call('ZCARD', KEYS[2]) >= tonumber(ARGV[2]) then return 0 end
++redis.call('ZADD', KEYS[2], tonumber(ARGV[1]) + tonumber(ARGV[3]), ARGV[4])
++redis.call('EXPIRE', KEYS[2], 600)
++redis.call('HSET', KEYS[1], unpack(ARGV, 5))
++redis.call('EXPIRE', KEYS[1], ARGV[3])
++return 1
++"#;
++
++/// Set the status to ARGV[1] if it currently is one of the other ARGV values
++const SCRIPT_TRANSITION: &str = r#"
++local current = redis.call('HGET', KEYS[1], 'status')
++if not current then return 0 end
++for i = 2, #ARGV do
++  if current == ARGV[i] then
++    redis.call('HSET', KEYS[1], 'status', ARGV[1])
++    return 1
++  end
++end
++return 0
++"#;
++
++/// Count a failed approve attempt of a claimed (`approving`) entry and either
++/// give it back (`scanned`) or deny it once ARGV[1] attempts are used up.
++/// Never recreates an expired entry. Returns -1 if it was not claimed.
++const SCRIPT_FAILED_ATTEMPT: &str = r#"
++if redis.call('HGET', KEYS[1], 'status') ~= 'approving' then return -1 end
++local attempts = redis.call('HINCRBY', KEYS[1], 'attempts', 1)
++if attempts >= tonumber(ARGV[1]) then
++  redis.call('HSET', KEYS[1], 'status', 'denied')
++  redis.call('EXPIRE', KEYS[1], ARGV[2])
++else
++  redis.call('HSET', KEYS[1], 'status', 'scanned')
++end
++return attempts
++"#;
++
++/// Store the session, but only if the entry still is claimed (`approving`),
++/// i.e. it has not expired in the meantime. KEYS: entry. ARGV: session, ttl.
++const SCRIPT_FINALISE: &str = r#"
++if redis.call('HGET', KEYS[1], 'status') ~= 'approving' then return 0 end
++redis.call('HSET', KEYS[1], 'session', ARGV[1], 'status', 'approved')
++redis.call('EXPIRE', KEYS[1], ARGV[2])
++return 1
++"#;
++
++/// Return the stored session and delete the entry, but only if it is approved,
++/// so that two parallel polls cannot both receive the session
++const SCRIPT_TAKE_APPROVED: &str = r#"
++if redis.call('HGET', KEYS[1], 'status') ~= 'approved' then return false end
++local session = redis.call('HGET', KEYS[1], 'session')
++redis.call('DEL', KEYS[1])
++return session
++"#;
++
++/// A JSON response that browsers and proxies must not cache
++pub struct NoStore<T>(Json<T>);
++
++impl<'r, 'o: 'r, T: Serialize> Responder<'r, 'o> for NoStore<T> {
++    fn respond_to(self, request: &'r Request<'_>) -> response::Result<'o> {
++        let mut response = self.0.respond_to(request)?;
++        response.set_header(Header::new("Cache-Control", "no-store"));
++        Ok(response)
++    }
++}
++
++impl<T: Serialize + JsonSchema + Send> OpenApiResponderInner for NoStore<T> {
++    fn responses(generator: &mut OpenApiGenerator) -> std::result::Result<Responses, OpenApiError> {
++        <Json<T> as OpenApiResponderInner>::responses(generator)
++    }
++}
++
++/// Where a request comes from, as far as the approver may see it
++pub struct ClientInfo {
++    /// Coarse IP (see `coarse_ip`), empty if unknown
++    ip: String,
++    /// Cleaned and shortened User-Agent, empty if unknown
++    user_agent: String,
++}
++
++#[rocket::async_trait]
++impl<'r> FromRequest<'r> for ClientInfo {
++    type Error = Error;
++
++    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
++        // `to_real_ip` honours the configured proxy header (X-Forwarded-For)
++        Outcome::Success(ClientInfo {
++            ip: coarse_ip(&to_real_ip(request).await),
++            user_agent: clean_text(
++                request.headers().get_one("User-Agent").unwrap_or_default(),
++                QR_MAX_AGENT_CHARS,
++            ),
++        })
++    }
++}
++
++impl OpenApiFromRequest<'_> for ClientInfo {
++    fn from_request_input(
++        _gen: &mut OpenApiGenerator,
++        _name: String,
++        _required: bool,
++    ) -> revolt_rocket_okapi::Result<RequestHeaderInput> {
++        Ok(RequestHeaderInput::None)
++    }
++}
++
++/// # Start QR Login Data
++#[derive(Deserialize, JsonSchema)]
++pub struct DataQrStart {
++    /// Friendly name used for the session that is created on approval
++    #[serde(default)]
++    friendly_name: Option<String>,
++}
++
++/// # Pending QR Login
++#[derive(Serialize, JsonSchema)]
++pub struct ResponseQrStart {
++    /// Id to put into the QR code
++    id: String,
++    /// Secret for polling, only for the new device
++    secret: String,
++    /// When the pending login expires
++    expires_at: Timestamp,
++}
++
++/// # Poll QR Login Data
++#[derive(Deserialize, JsonSchema)]
++pub struct DataQrPoll {
++    /// Secret returned when the QR login was started
++    secret: String,
++}
++
++/// # QR Login State
++#[derive(Serialize, JsonSchema)]
++#[serde(tag = "status", rename_all = "lowercase")]
++pub enum ResponseQrPoll {
++    /// Waiting for a logged-in device to scan the code
++    Pending,
++    /// A logged-in device opened the request and is deciding
++    Scanned,
++    /// The request was denied
++    Denied,
++    /// The request expired, does not exist or the secret was wrong
++    Expired,
++    /// The request was approved. This is returned exactly once.
++    Approved { session: v0::Session },
++}
++
++/// What the approver has to enter to approve
++#[derive(Serialize, JsonSchema)]
++#[serde(rename_all = "snake_case")]
++pub enum QrApproveMethod {
++    /// The account has no MFA, ask for the account password
++    Password,
++    /// The account has MFA, ask for a TOTP code or a recovery code
++    TotpOrRecovery,
++}
++
++/// # Pending QR Login Info
++#[derive(Serialize, JsonSchema)]
++pub struct ResponseQrInfo {
++    /// Friendly name of the device that wants to log in
++    friendly_name: String,
++    /// When the new device created the request
++    created_at: Timestamp,
++    /// When the request expires
++    expires_at: Timestamp,
++    /// What to ask the user for when approving
++    method: QrApproveMethod,
++    /// Coarse IP address (last part hidden) the request came from
++    #[serde(skip_serializing_if = "Option::is_none")]
++    ip: Option<String>,
++    /// User-Agent the request came from
++    #[serde(skip_serializing_if = "Option::is_none")]
++    user_agent: Option<String>,
++}
++
++/// # Approve QR Login Data
++#[derive(Deserialize, JsonSchema)]
++pub struct DataQrApprove {
++    /// Required: `{"password"}` for accounts without MFA, otherwise
++    /// `{"totp_code"}` or `{"recovery_code"}`
++    #[serde(default)]
++    mfa_response: Option<v0::MFAResponse>,
++}
++
++/// Valkey key of a pending login
++fn key(id: &str) -> String {
++    format!("anytalk:qr:{id}")
++}
++
++/// Check that an id looks like one we generated, before it goes into a key
++fn valid_id(id: &str) -> bool {
++    id.len() == QR_ID_LEN
++        && id
++            .bytes()
++            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
++}
++
++/// Remove control, bidi and zero-width characters, trim and shorten text
++fn clean_text(text: &str, max_chars: usize) -> String {
++    let cleaned: String = text
++        .chars()
++        .filter(|c| {
++            !c.is_control()
++                && !matches!(
++                    c,
++                    '\u{061C}'
++                        | '\u{200B}'..='\u{200F}'
++                        | '\u{202A}'..='\u{202E}'
++                        | '\u{2060}'..='\u{2064}'
++                        | '\u{2066}'..='\u{2069}'
++                        | '\u{FEFF}'
++                )
++        })
++        .take(max_chars)
++        .collect();
++    cleaned.trim().to_string()
++}
++
++/// Friendly name for the new session, "Unknown" if nothing usable is left
++fn clean_name(name: Option<String>) -> String {
++    let name = clean_text(&name.unwrap_or_default(), QR_MAX_NAME_CHARS);
++    if name.is_empty() {
++        "Unknown".to_string()
++    } else {
++        name
++    }
++}
++
++/// Hide the last part of an IP address (IPv4 /24, IPv6 /48)
++fn coarse_ip(ip: &str) -> String {
++    match ip.parse::<IpAddr>() {
++        Ok(IpAddr::V4(ip)) => {
++            let [a, b, c, _] = ip.octets();
++            format!("{a}.{b}.{c}.0")
++        }
++        Ok(IpAddr::V6(ip)) => {
++            let [a, b, c, ..] = ip.segments();
++            format!("{a:x}:{b:x}:{c:x}::")
++        }
++        Err(_) => String::new(),
++    }
++}
++
++/// Hex SHA-256 of a polling secret
++fn hash_secret(secret: &str) -> String {
++    Sha256::digest(secret.as_bytes())
++        .iter()
++        .map(|byte| format!("{byte:02x}"))
++        .collect()
++}
++
++/// Compare two strings in constant time (for equal length)
++fn constant_time_eq(a: &str, b: &str) -> bool {
++    a.len() == b.len()
++        && a.bytes()
++            .zip(b.bytes())
++            .fold(0u8, |diff, (x, y)| diff | (x ^ y))
++            == 0
++}
++
++/// Open a Valkey connection
++async fn connection() -> Result<Conn> {
++    get_connection()
++        .await
++        .map_err(|_| create_error!(InternalError))
++}
++
++/// Atomically move the entry to `to` if it is currently in one of `from`
++async fn transition(conn: &mut Conn, id: &str, to: &str, from: &[&str]) -> Result<bool> {
++    let moved: i32 = redis::Script::new(SCRIPT_TRANSITION)
++        .key(key(id))
++        .arg(to)
++        .arg(from)
++        .invoke_async(&mut **conn)
++        .await
++        .to_internal_error()?;
++
++    Ok(moved == 1)
++}
++
++/// Fields of a pending login that has not been decided yet
++struct Pending {
++    friendly_name: String,
++    created_at: Timestamp,
++    ip: Option<String>,
++    user_agent: Option<String>,
++}
++
++/// Fetch a pending login that can still be approved or denied
++async fn fetch_pending(conn: &mut Conn, id: &str) -> Result<Pending> {
++    if !valid_id(id) {
++        return Err(create_error!(NotFound));
++    }
++
++    let (status, friendly_name, created_at, ip, user_agent): (
++        Option<String>,
++        Option<String>,
++        Option<String>,
++        Option<String>,
++        Option<String>,
++    ) = redis::cmd("HMGET")
++        .arg(key(id))
++        .arg(&["status", "name", "created", "ip", "ua"])
++        .query_async(&mut **conn)
++        .await
++        .to_internal_error()?;
++
++    match (status.as_deref(), friendly_name, created_at) {
++        (Some("pending" | "scanned"), Some(friendly_name), Some(created_at)) => Ok(Pending {
++            friendly_name,
++            created_at: Timestamp::parse(&created_at).to_internal_error()?,
++            ip: ip.filter(|ip| !ip.is_empty()),
++            user_agent: user_agent.filter(|agent| !agent.is_empty()),
++        }),
++        _ => Err(create_error!(NotFound)),
++    }
++}
++
++/// # Start QR Login
++///
++/// Start a login for a new device. The returned `id` is shown as a QR code,
++/// the `secret` is used by the new device to poll for the result.
++#[openapi(tag = "Session")]
++#[post("/qr", data = "<data>")]
++pub async fn start(
++    data: Json<DataQrStart>,
++    client: ClientInfo,
++) -> Result<NoStore<ResponseQrStart>> {
++    let id = nanoid::nanoid!(QR_ID_LEN);
++    let secret = nanoid::nanoid!(64);
++    let now = Timestamp::now_utc();
++    let name = clean_name(data.into_inner().friendly_name);
++
++    let mut conn = connection().await?;
++    let created: i32 = redis::Script::new(SCRIPT_START)
++        .key(key(&id))
++        .key(QR_INDEX_KEY)
++        .arg(
++            std::time::SystemTime::now()
++                .duration_since(std::time::UNIX_EPOCH)
++                .to_internal_error()?
++                .as_secs(),
++        )
++        .arg(QR_MAX_PENDING)
++        .arg(QR_TTL_SECS)
++        .arg(&id)
++        .arg("secret")
++        .arg(hash_secret(&secret))
++        .arg("name")
++        .arg(name)
++        .arg("created")
++        .arg(now.format().to_string())
++        .arg("status")
++        .arg("pending")
++        .arg("attempts")
++        .arg(0)
++        .arg("ip")
++        .arg(client.ip)
++        .arg("ua")
++        .arg(client.user_agent)
++        .invoke_async(&mut *conn)
++        .await
++        .to_internal_error()?;
++
++    // Too many pending logins right now
++    if created != 1 {
++        return Err(create_error!(OperationFailed));
++    }
++
++    Ok(NoStore(Json(ResponseQrStart {
++        id,
++        secret,
++        expires_at: now
++            .checked_add(Duration::seconds(QR_TTL_SECS))
++            .to_internal_error()?,
++    })))
++}
++
++/// # Poll QR Login
++///
++/// Called by the new device. An approved login returns the new session once,
++/// then the pending login is deleted. A wrong secret looks like an unknown id.
++#[openapi(tag = "Session")]
++#[post("/qr/<id>/poll", data = "<data>")]
++pub async fn poll(id: &str, data: Json<DataQrPoll>) -> Result<NoStore<ResponseQrPoll>> {
++    if !valid_id(id) {
++        return Ok(NoStore(Json(ResponseQrPoll::Expired)));
++    }
++
++    let mut conn = connection().await?;
++
++    let stored: Option<String> = conn.hget(key(id), "secret").await.to_internal_error()?;
++    let Some(stored) = stored else {
++        return Ok(NoStore(Json(ResponseQrPoll::Expired)));
++    };
++
++    if !constant_time_eq(&stored, &hash_secret(&data.secret)) {
++        return Ok(NoStore(Json(ResponseQrPoll::Expired)));
++    }
++
++    let status: Option<String> = conn.hget(key(id), "status").await.to_internal_error()?;
++    Ok(NoStore(Json(match status.as_deref() {
++        Some("pending") => ResponseQrPoll::Pending,
++        Some("scanned" | "approving") => ResponseQrPoll::Scanned,
++        Some("denied") => {
++            let _: () = conn.del(key(id)).await.to_internal_error()?;
++            ResponseQrPoll::Denied
++        }
++        Some("approved") => {
++            let session: Option<String> = redis::Script::new(SCRIPT_TAKE_APPROVED)
++                .key(key(id))
++                .invoke_async(&mut *conn)
++                .await
++                .to_internal_error()?;
++
++            match session {
++                Some(session) => ResponseQrPoll::Approved {
++                    session: serde_json::from_str(&session).to_internal_error()?,
++                },
++                // Another poll took it first
++                None => ResponseQrPoll::Expired,
++            }
++        }
++        _ => ResponseQrPoll::Expired,
++    })))
++}
++
++/// # Fetch QR Login Info
++///
++/// Called by a logged-in device after scanning the code. Marks the pending
++/// login as scanned (hence POST).
++#[openapi(tag = "Session")]
++#[post("/qr/<id>/info")]
++pub async fn info(id: &str, _session: Session, account: Account) -> Result<Json<ResponseQrInfo>> {
++    if account.disabled {
++        return Err(create_error!(InvalidOperation));
++    }
++
++    let mut conn = connection().await?;
++    let pending = fetch_pending(&mut conn, id).await?;
++    transition(&mut conn, id, "scanned", &["pending"]).await?;
++
++    Ok(Json(ResponseQrInfo {
++        friendly_name: pending.friendly_name,
++        expires_at: pending
++            .created_at
++            .checked_add(Duration::seconds(QR_TTL_SECS))
++            .to_internal_error()?,
++        created_at: pending.created_at,
++        method: if account.mfa.is_active() {
++            QrApproveMethod::TotpOrRecovery
++        } else {
++            QrApproveMethod::Password
++        },
++        ip: pending.ip,
++        user_agent: pending.user_agent,
++    }))
++}
++
++/// # Approve QR Login
++///
++/// Create a session for the new device on this account. Needs the password,
++/// or an MFA response if the account has MFA active.
++#[openapi(tag = "Session")]
++#[post("/qr/<id>/approve", data = "<data>")]
++pub async fn approve(
++    db: &State<Database>,
++    id: &str,
++    _session: Session,
++    mut account: Account,
++    data: Json<DataQrApprove>,
++) -> Result<rocket::response::status::NoContent> {
++    // Same rule as login: disabled accounts cannot create sessions
++    if account.disabled {
++        return Err(create_error!(InvalidOperation));
++    }
++
++    let mut conn = connection().await?;
++    let pending = fetch_pending(&mut conn, id).await?;
++
++    // Check for account lockout, like login
++    if let Some(lockout) = &account.lockout {
++        if lockout
++            .expiry
++            .is_some_and(|expiry| expiry > Timestamp::now_utc())
++        {
++            db.bump_lockout_count(&account.id).await?;
++            return Err(create_error!(LockedOut));
++        }
++    }
++
++    let Some(response) = data.into_inner().mfa_response else {
++        return Err(if account.mfa.is_active() {
++            create_error!(InvalidToken)
++        } else {
++            create_error!(InvalidCredentials)
++        });
++    };
++
++    // Claim the request first, so that only one approve can win and a losing
++    // one does not spend a recovery code
++    if !transition(&mut conn, id, "approving", &["pending", "scanned"]).await? {
++        return Err(create_error!(InvalidOperation));
++    }
++
++    // Password for accounts without MFA, TOTP or recovery code otherwise
++    if let Err(err) = account.consume_mfa_response(db, response, None).await {
++        db.bump_lockout_count(&account.id).await?;
++
++        // Give the request back, or deny it when the attempts are used up
++        let _: i64 = redis::Script::new(SCRIPT_FAILED_ATTEMPT)
++            .key(key(id))
++            .arg(QR_MAX_ATTEMPTS)
++            .arg(QR_RESULT_TTL_SECS)
++            .invoke_async(&mut *conn)
++            .await
++            .to_internal_error()?;
++
++        return Err(err);
++    }
++
++    // Verified, clear lockout information if present
++    if account.lockout.is_some() {
++        account.lockout = None;
++        account.save(db).await?;
++    }
++
++    let session = match account.create_session(db, pending.friendly_name).await {
++        Ok(session) => session,
++        Err(err) => {
++            // Let the approver try again
++            transition(&mut conn, id, "scanned", &["approving"]).await?;
++            return Err(err);
++        }
++    };
++
++    // Hand the session over, but only if the request is still claimed
++    let stored = redis::Script::new(SCRIPT_FINALISE)
++        .key(key(id))
++        .arg(serde_json::to_string(&v0::Session::from(session.clone())).to_internal_error()?)
++        .arg(QR_RESULT_TTL_SECS)
++        .invoke_async::<_, i32>(&mut *conn)
++        .await;
++
++    if !matches!(stored, Ok(1)) {
++        // Expired meanwhile or Valkey failed: nobody can collect this session
++        log::warn!("QR login {id} could not be finalised ({stored:?}), removing session");
++        session.delete(db).await?;
++        return Err(match stored {
++            Err(_) => create_error!(InternalError),
++            Ok(_) => create_error!(NotFound),
++        });
++    }
++
++    Ok(rocket::response::status::NoContent)
++}
++
++/// # Deny QR Login
++///
++/// Reject a pending QR login.
++#[openapi(tag = "Session")]
++#[post("/qr/<id>/deny")]
++pub async fn deny(id: &str, _session: Session) -> Result<rocket::response::status::NoContent> {
++    if !valid_id(id) {
++        return Err(create_error!(NotFound));
++    }
++
++    let mut conn = connection().await?;
++
++    if !transition(&mut conn, id, "denied", &["pending", "scanned"]).await? {
++        return Err(create_error!(NotFound));
++    }
++
++    let _: () = conn
++        .expire(key(id), QR_RESULT_TTL_SECS as usize)
++        .await
++        .to_internal_error()?;
++
++    Ok(rocket::response::status::NoContent)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::{clean_name, coarse_ip, key, valid_id, SCRIPT_FINALISE};
++    use crate::{rocket, util::test::TestHarness};
++    use redis_kiss::{get_connection, redis, AsyncCommands};
++    use revolt_database::Totp;
++    use rocket::http::{ContentType, Header, Status};
++
++    #[test]
++    fn cleans_names() {
++        assert_eq!(clean_name(None), "Unknown");
++        assert_eq!(clean_name(Some("  \u{202E}\n\u{200B} ".into())), "Unknown");
++        assert_eq!(clean_name(Some(" My\u{202E} Phone\n".into())), "My Phone");
++        assert_eq!(clean_name(Some("a".repeat(500))).chars().count(), 64);
++    }
++
++    #[test]
++    fn validates_ids_and_hides_ips() {
++        assert!(valid_id(&"aZ09_-".repeat(6)[..32]));
++        assert!(!valid_id("short"));
++        assert!(!valid_id(&"a:".repeat(16)));
++        assert_eq!(coarse_ip("203.0.113.77"), "203.0.113.0");
++        assert_eq!(coarse_ip("2001:db8:1234:5678::1"), "2001:db8:1234::");
++        assert_eq!(coarse_ip("garbage"), "");
++    }
++
++    /// Start a QR login, returns (id, secret)
++    async fn start_login(harness: &TestHarness) -> (String, String) {
++        let res = harness
++            .client
++            .post("/auth/session/qr")
++            .header(ContentType::JSON)
++            .header(Header::new("User-Agent", "TestAgent/1.0"))
++            .body(json!({ "friendly_name": "Phone" }).to_string())
++            .dispatch()
++            .await;
++        assert_eq!(res.status(), Status::Ok);
++        assert_eq!(res.headers().get_one("Cache-Control"), Some("no-store"));
++        assert_eq!(res.headers().get_one("X-RateLimit-Limit"), Some("5"));
++        let body: serde_json::Value = res.into_json().await.unwrap();
++        (
++            body["id"].as_str().unwrap().to_string(),
++            body["secret"].as_str().unwrap().to_string(),
++        )
++    }
++
++    /// Poll a QR login with the given secret
++    async fn poll_login(harness: &TestHarness, id: &str, secret: &str) -> serde_json::Value {
++        let res = harness
++            .client
++            .post(format!("/auth/session/qr/{id}/poll"))
++            .header(ContentType::JSON)
++            .body(json!({ "secret": secret }).to_string())
++            .dispatch()
++            .await;
++        assert_eq!(res.status(), Status::Ok);
++        assert_eq!(res.headers().get_one("Cache-Control"), Some("no-store"));
++        assert_eq!(res.headers().get_one("X-RateLimit-Limit"), Some("20"));
++        res.into_json().await.unwrap()
++    }
++
++    /// Approve a QR login as the given session with a JSON body
++    async fn approve(harness: &TestHarness, id: &str, token: &str, body: String) -> Status {
++        harness
++            .client
++            .post(format!("/auth/session/qr/{id}/approve"))
++            .header(ContentType::JSON)
++            .header(Header::new("X-Session-Token", token.to_string()))
++            .body(body)
++            .dispatch()
++            .await
++            .status()
++    }
++
++    #[rocket::async_test]
++    async fn success_approve_once() {
++        let harness = TestHarness::new().await;
++        let (_, session, _) = harness.new_user().await;
++        let (id, secret) = start_login(&harness).await;
++        let password = json!({ "mfa_response": { "password": "password_insecure" } }).to_string();
++
++        assert_eq!(
++            poll_login(&harness, &id, &secret).await["status"],
++            "pending"
++        );
++        // A wrong secret looks like an unknown id
++        assert_eq!(
++            poll_login(&harness, &id, "wrong").await["status"],
++            "expired"
++        );
++
++        let res = harness
++            .client
++            .post(format!("/auth/session/qr/{id}/info"))
++            .header(Header::new("X-Session-Token", session.token.clone()))
++            .dispatch()
++            .await;
++        assert_eq!(res.status(), Status::Ok);
++        let info: serde_json::Value = res.into_json().await.unwrap();
++        assert_eq!(info["friendly_name"], "Phone");
++        assert_eq!(info["method"], "password");
++        assert_eq!(info["user_agent"], "TestAgent/1.0");
++        assert!(info.get("secret").is_none());
++        assert_eq!(
++            poll_login(&harness, &id, &secret).await["status"],
++            "scanned"
++        );
++
++        // No password or a wrong one does not approve and keeps the request open
++        let tok = &session.token;
++        assert_eq!(
++            approve(&harness, &id, tok, "{}".into()).await,
++            Status::Unauthorized
++        );
++        let wrong = json!({ "mfa_response": { "password": "nope" } }).to_string();
++        assert_eq!(
++            approve(&harness, &id, tok, wrong).await,
++            Status::Unauthorized
++        );
++        assert_eq!(
++            poll_login(&harness, &id, &secret).await["status"],
++            "scanned"
++        );
++
++        assert_eq!(
++            approve(&harness, &id, tok, password.clone()).await,
++            Status::NoContent
++        );
++        // A second approve must not create another session
++        assert_eq!(
++            approve(&harness, &id, tok, password).await,
++            Status::NotFound
++        );
++
++        let body = poll_login(&harness, &id, &secret).await;
++        assert_eq!(body["status"], "approved");
++        assert_eq!(body["session"]["user_id"], session.user_id);
++        assert_eq!(body["session"]["name"], "Phone");
++
++        // The session is handed out exactly once
++        assert_eq!(
++            poll_login(&harness, &id, &secret).await["status"],
++            "expired"
++        );
++    }
++
++    #[rocket::async_test]
++    async fn fail_malformed_id_and_deny() {
++        let harness = TestHarness::new().await;
++        let (_, session, _) = harness.new_user().await;
++        let (id, secret) = start_login(&harness).await;
++
++        let res = harness
++            .client
++            .post("/auth/session/qr/not-an-id/deny")
++            .header(Header::new("X-Session-Token", session.token.clone()))
++            .dispatch()
++            .await;
++        assert_eq!(res.status(), Status::NotFound);
++
++        let res = harness
++            .client
++            .post(format!("/auth/session/qr/{id}/deny"))
++            .header(Header::new("X-Session-Token", session.token.clone()))
++            .dispatch()
++            .await;
++        assert_eq!(res.status(), Status::NoContent);
++        assert_eq!(poll_login(&harness, &id, &secret).await["status"], "denied");
++        assert_eq!(
++            poll_login(&harness, &id, &secret).await["status"],
++            "expired"
++        );
++    }
++
++    #[rocket::async_test]
++    async fn fail_mfa_required() {
++        let harness = TestHarness::new().await;
++        let (mut account, session, _) = harness.new_user().await;
++        let totp = Totp::Enabled {
++            secret: "secret".to_string(),
++        };
++        account.mfa.totp_token = totp.clone();
++        account.save(&harness.db).await.unwrap();
++        let (id, secret) = start_login(&harness).await;
++        let tok = &session.token;
++
++        assert_eq!(
++            approve(&harness, &id, tok, "{}".into()).await,
++            Status::Unauthorized
++        );
++        // The password is not accepted for accounts with MFA
++        let password = json!({ "mfa_response": { "password": "password_insecure" } }).to_string();
++        assert_eq!(
++            approve(&harness, &id, tok, password).await,
++            Status::BadRequest
++        );
++        let wrong = json!({ "mfa_response": { "totp_code": "000000" } }).to_string();
++        assert_eq!(
++            approve(&harness, &id, tok, wrong).await,
++            Status::Unauthorized
++        );
++        assert_eq!(
++            poll_login(&harness, &id, &secret).await["status"],
++            "scanned"
++        );
++
++        let code = totp.generate_code().unwrap();
++        let good = json!({ "mfa_response": { "totp_code": code } }).to_string();
++        assert_eq!(approve(&harness, &id, tok, good).await, Status::NoContent);
++        assert_eq!(
++            poll_login(&harness, &id, &secret).await["status"],
++            "approved"
++        );
++    }
++
++    /// Rate limits are not enforced in the test environment, so this checks
++    /// that start and poll land in their own buckets and that polls are
++    /// counted per QR id.
++    #[rocket::async_test]
++    async fn poll_and_start_use_their_own_buckets() {
++        let harness = TestHarness::new().await;
++        let bucket = |res: &rocket::local::asynchronous::LocalResponse<'_>| {
++            let get = |name| res.headers().get_one(name).map(str::to_string);
++            (get("X-RateLimit-Limit"), get("X-RateLimit-Bucket"))
++        };
++        let poll = |id: String| {
++            let client = &harness.client;
++            async move {
++                client
++                    .post(format!("/auth/session/qr/{id}/poll"))
++                    .header(ContentType::JSON)
++                    .body(json!({ "secret": "x" }).to_string())
++                    .dispatch()
++                    .await
++            }
++        };
++
++        let (id_a, id_b) = (nanoid::nanoid!(32), nanoid::nanoid!(32));
++        let first = bucket(&poll(id_a.clone()).await);
++        assert_eq!(first.0.as_deref(), Some("20"));
++        assert_eq!(first, bucket(&poll(id_a).await));
++        assert_ne!(first.1, bucket(&poll(id_b).await).1);
++
++        let res = harness
++            .client
++            .post("/auth/session/qr")
++            .header(ContentType::JSON)
++            .body("{}")
++            .dispatch()
++            .await;
++        let start = bucket(&res);
++        assert_eq!(start.0.as_deref(), Some("5"));
++        assert_ne!(start.1, first.1);
++    }
++
++    #[rocket::async_test]
++    async fn fail_approve_after_expiry_creates_no_session() {
++        let harness = TestHarness::new().await;
++        let (_, session, _) = harness.new_user().await;
++        let (id, secret) = start_login(&harness).await;
++        let before = harness.db.fetch_sessions(&session.user_id).await.unwrap().len();
++
++        // Simulate the entry expiring
++        let mut conn = get_connection().await.unwrap();
++        let _: () = conn.del(key(&id)).await.unwrap();
++
++        let password = json!({ "mfa_response": { "password": "password_insecure" } }).to_string();
++        assert_eq!(
++            approve(&harness, &id, &session.token, password).await,
++            Status::NotFound
++        );
++        assert_eq!(
++            poll_login(&harness, &id, &secret).await["status"],
++            "expired"
++        );
++        let after = harness.db.fetch_sessions(&session.user_id).await.unwrap().len();
++        assert_eq!(before, after);
++    }
++
++    /// Run the finalise script on an entry
++    async fn finalise(conn: &mut redis_kiss::Conn, id: &str) -> i32 {
++        redis::Script::new(SCRIPT_FINALISE)
++            .key(key(id))
++            .arg("{}")
++            .arg(60)
++            .invoke_async::<_, i32>(&mut **conn)
++            .await
++            .unwrap()
++    }
++
++    #[rocket::async_test]
++    async fn finalise_only_writes_to_claimed_entries() {
++        let mut conn = get_connection().await.unwrap();
++        let id = nanoid::nanoid!(32);
++        // Expired (missing) entry: nothing is written, nothing is recreated
++        assert_eq!(finalise(&mut conn, &id).await, 0);
++        let exists: bool = conn.exists(key(&id)).await.unwrap();
++        assert!(!exists);
++
++        // Not claimed
++        let _: () = conn.hset(key(&id), "status", "scanned").await.unwrap();
++        assert_eq!(finalise(&mut conn, &id).await, 0);
++
++        // Claimed
++        let _: () = conn.hset(key(&id), "status", "approving").await.unwrap();
++        assert_eq!(finalise(&mut conn, &id).await, 1);
++        let status: String = conn.hget(key(&id), "status").await.unwrap();
++        assert_eq!(status, "approved");
++        let _: () = conn.del(key(&id)).await.unwrap();
++    }
++}
+diff --git a/crates/delta/src/util/ratelimits.rs b/crates/delta/src/util/ratelimits.rs
+index 2ed0962..45cf325 100644
+--- a/crates/delta/src/util/ratelimits.rs
++++ b/crates/delta/src/util/ratelimits.rs
+@@ -36,6 +36,16 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
+                     ("channels", Some(id))
+                 }
+                 ("servers", Some(id), _) => ("servers", Some(id)),
++                // Starting a QR login and polling it (id is segment 3, "poll" segment 4).
++                // Polls are counted per QR id as well as per client, so they still
++                // get their own budget when a proxy hides the real client IP.
++                ("auth", Some("session"), Method::Post) if extra == Some("qr") => {
++                    match request.routed_segment(4) {
++                        Some("poll") => ("auth_qr_poll", request.routed_segment(3)),
++                        None => ("auth_qr_start", None),
++                        _ => ("auth", None),
++                    }
++                }
+                 ("auth", _, _) => {
+                     if request.method() == Method::Delete {
+                         ("auth_delete", None)
+@@ -62,6 +72,9 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
+             "channels" => 15,
+             "servers" => 5,
+             "auth" => 15,
++            // One poll every 2 s is 5 per window, leave room for retries
++            "auth_qr_poll" => 20,
++            "auth_qr_start" => 5,
+             "auth_delete" => 255,
+             "default_avatar" => 255,
+             "swagger" => 100,
