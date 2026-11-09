@@ -45,7 +45,7 @@ Public visibility: GitHub creates new container packages as private for personal
 
 ## How updates work
 
-- A daily workflow looks up the latest upstream release and builds it if `<tag>-anytalk` doesn't exist yet.
+- There is no scheduled run: a new Stoat release is not built on its own. Build it by hand (below) when you want to update.
 - Manual build: Actions, "Build patched Stoat server", "Run workflow". Enter an upstream tag (e.g. `v0.15.7`), or leave it empty for the latest release. Tick "force" to rebuild an existing tag.
 - Pushing changes to `patches/` or the workflow on `main` rebuilds the latest release.
 - When Stoat releases: update all Stoat service tags in Coolify to the new version, and use the `-anytalk` tag for the api service. Keep the patched api on the same version as the other Stoat services.

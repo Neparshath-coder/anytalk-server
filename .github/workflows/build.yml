@@ -12,8 +12,6 @@ on:
         required: false
         type: boolean
         default: false
-  schedule:
-    - cron: "17 4 * * *"
   push:
     branches: [main]
     paths:
@@ -76,9 +74,9 @@ jobs:
           echo "Upstream tag: $tag"
           image="ghcr.io/$owner/anytalk-server-api:$tag-anytalk"
           build=true
-          # Scheduled runs and manual runs without "force" skip when the image
-          # already exists. Pushes always build (the patch changed).
-          if [ "$EVENT" = "schedule" ] || { [ "$EVENT" = "workflow_dispatch" ] && [ "$INPUT_FORCE" != "true" ]; }; then
+          # Manual runs without "force" skip when the image already exists.
+          # Pushes always build (the patch changed).
+          if [ "$EVENT" = "workflow_dispatch" ] && [ "$INPUT_FORCE" != "true" ]; then
             if docker buildx imagetools inspect "$image" >/dev/null 2>&1; then
               echo "$image already exists, nothing to do."
               build=false
