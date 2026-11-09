@@ -29,8 +29,12 @@ Pushing a change to `patches/**` or the workflow on `main` rebuilds the latest r
 
 - Stream viewers: LiveKit data messages, topic `anytalk:watching` (`components/rtc/components/StreamViewers.tsx` in AnyTalk).
 - Deafen indicator: `setAttributes({ deafened })` (`components/rtc/state.tsx` in AnyTalk).
+- Call E2EE: key exchange via LiveKit data messages and a hello attribute (`components/rtc/e2ee/callE2ee.ts` in AnyTalk).
+- Profile banner colour (`profile.banner_hue`) and QR login (`/auth/session/qr/*`).
 
-If a patch stops applying, these features break silently. The client gets permission errors and the call itself keeps working.
+If a patch stops applying, the viewer and deafen features break silently: the client gets permission errors and the call keeps working. E2EE is different: without the data grant the key exchange fails, and since unencrypted tracks are refused, the call itself can break.
+
+The other services run official images, so a patch must never add new enum variants to anything the api publishes as an event (see README).
 
 ## Git
 
