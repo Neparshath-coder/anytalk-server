@@ -49,10 +49,10 @@ index 9e11561..e0671b1 100644
  }
 diff --git a/crates/delta/src/routes/session/qr.rs b/crates/delta/src/routes/session/qr.rs
 new file mode 100644
-index 0000000..c25db0f
+index 0000000..e3aa3a7
 --- /dev/null
 +++ b/crates/delta/src/routes/session/qr.rs
-@@ -0,0 +1,955 @@
+@@ -0,0 +1,982 @@
 +//! Log in a new device by scanning a QR code with an already logged-in one
 +//!
 +//! POST /session/qr, POST /session/qr/<id>/poll, POST /session/qr/<id>/info,
@@ -625,14 +625,18 @@ index 0000000..c25db0f
 +    if let Err(err) = account.consume_mfa_response(db, response, None).await {
 +        db.bump_lockout_count(&account.id).await?;
 +
-+        // Give the request back, or deny it when the attempts are used up
-+        let _: i64 = redis::Script::new(SCRIPT_FAILED_ATTEMPT)
++        // Give the request back, or deny it when the attempts are used up.
++        // A Valkey error here must not hide the MFA error; the entry then
++        // stays claimed until it expires.
++        if let Err(redis_err) = redis::Script::new(SCRIPT_FAILED_ATTEMPT)
 +            .key(key(id))
 +            .arg(QR_MAX_ATTEMPTS)
 +            .arg(QR_RESULT_TTL_SECS)
-+            .invoke_async(&mut *conn)
++            .invoke_async::<_, i64>(&mut *conn)
 +            .await
-+            .to_internal_error()?;
++        {
++            log::warn!("QR login {id}: could not count failed attempt: {redis_err:?}");
++        }
 +
 +        return Err(err);
 +    }
@@ -699,7 +703,7 @@ index 0000000..c25db0f
 +
 +#[cfg(test)]
 +mod tests {
-+    use super::{clean_name, coarse_ip, key, valid_id, SCRIPT_FINALISE};
++    use super::{clean_name, coarse_ip, key, valid_id, QR_MAX_ATTEMPTS, SCRIPT_FINALISE};
 +    use crate::{rocket, util::test::TestHarness};
 +    use redis_kiss::{get_connection, redis, AsyncCommands};
 +    use revolt_database::Totp;
@@ -974,6 +978,29 @@ index 0000000..c25db0f
 +        );
 +        let after = harness.db.fetch_sessions(&session.user_id).await.unwrap().len();
 +        assert_eq!(before, after);
++    }
++
++    #[rocket::async_test]
++    async fn fail_wrong_password_denies_after_max_attempts() {
++        let harness = TestHarness::new().await;
++        let (_, session, _) = harness.new_user().await;
++        let (id, secret) = start_login(&harness).await;
++        let wrong = json!({ "mfa_response": { "password": "nope" } }).to_string();
++        let mut conn = get_connection().await.unwrap();
++
++        for attempt in 1..=QR_MAX_ATTEMPTS {
++            assert_eq!(
++                approve(&harness, &id, &session.token, wrong.clone()).await,
++                Status::Unauthorized
++            );
++            let attempts: i64 = conn.hget(key(&id), "attempts").await.unwrap();
++            assert_eq!(attempts, attempt);
++            let status: String = conn.hget(key(&id), "status").await.unwrap();
++            let expected = if attempt < QR_MAX_ATTEMPTS { "scanned" } else { "denied" };
++            assert_eq!(status, expected);
++        }
++
++        assert_eq!(poll_login(&harness, &id, &secret).await["status"], "denied");
 +    }
 +
 +    /// Run the finalise script on an entry
