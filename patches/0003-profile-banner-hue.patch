@@ -1,5 +1,5 @@
 diff --git a/crates/core/database/src/models/users/model.rs b/crates/core/database/src/models/users/model.rs
-index bda1b21..2a102b9 100644
+index bda1b21..3a68e9c 100644
 --- a/crates/core/database/src/models/users/model.rs
 +++ b/crates/core/database/src/models/users/model.rs
 @@ -78,6 +78,7 @@ auto_derived!(
@@ -20,7 +20,23 @@ index bda1b21..2a102b9 100644
      }
  
      /// Bot information for if the user is a bot
-@@ -723,6 +727,11 @@ impl User {
+@@ -690,7 +694,14 @@ impl User {
+         EventV1::UserUpdate {
+             id: self.id.clone(),
+             data: partial.into(),
+-            clear: remove.into_iter().map(|v| v.into()).collect(),
++            // ProfileBannerHue is AnyTalk-only: the official events service
++            // can't decode it and would drop the whole event. Clients read
++            // the profile over the API, and the event carries no profile.
++            clear: remove
++                .into_iter()
++                .filter(|v| !matches!(v, FieldsUser::ProfileBannerHue))
++                .map(|v| v.into())
++                .collect(),
+             event_id: Some(Ulid::new().to_string()),
+         }
+         .p(self.id.clone())
+@@ -723,6 +734,11 @@ impl User {
                      x.background = None;
                  }
              }
@@ -32,7 +48,7 @@ index bda1b21..2a102b9 100644
              FieldsUser::DisplayName => self.display_name = None,
              FieldsUser::Pronouns => self.pronouns = None,
              FieldsUser::Suspension => self.suspended_until = None,
-@@ -828,6 +837,7 @@ impl User {
+@@ -828,6 +844,7 @@ impl User {
                  FieldsUser::StatusPresence,
                  FieldsUser::ProfileContent,
                  FieldsUser::ProfileBackground,

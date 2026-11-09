@@ -21,7 +21,8 @@ Why: the AnyTalk client sends LiveKit data messages (topic `anytalk:watching`, s
 - Adds an optional `banner_hue` (0-359, `u16`) to the user profile (database `UserProfile` and v0 `UserProfile`, skipped when unset). Old documents without it still deserialize because it is optional.
 - `PATCH /users/@me` accepts `profile.banner_hue`, validated to 0-359 (otherwise `FailedValidation`). It is merged into the existing profile, so setting `content`, `background` or `banner_hue` alone keeps the others.
 - New `FieldsUser::ProfileBannerHue` (`"ProfileBannerHue"` in `remove`) clears it (Mongo path `profile.banner_hue`).
-- The hue comes back in `GET /users/{id}/profile`, the edit response and the `UserUpdate` event, like `background`.
+- The hue comes back in `GET /users/{id}/profile`, like `background`. The `UserUpdate` event carries no profile data (upstream's event user has no profile field), so clients reload the profile over the API.
+- `ProfileBannerHue` is left out of the `clear` list of the `UserUpdate` event (`User::update` in `models/users/model.rs`). The official events service doesn't know the value and would drop the whole event, including other fields changed in the same edit and account deletions, which clear every profile field.
 
 `patches/0004-qr-login.patch` (log in a new device by scanning a QR code, applies on top of 0003):
 
@@ -31,7 +32,7 @@ Why: the AnyTalk client sends LiveKit data messages (topic `anytalk:watching`, s
 - `POST /auth/session/qr/{id}/info`, `POST .../approve` and `POST .../deny` need a session. `info` marks the request scanned and says which method `approve` needs (`password` or `totp_or_recovery`). `approve` requires the account password (no MFA) or a TOTP/recovery code (MFA), refuses disabled accounts, applies the account lockout, claims the request atomically (Lua scripts) so concurrent approves create one session only, and denies the request after 3 wrong answers. A session that cannot be handed over (request expired meanwhile) is deleted again.
 - `util/ratelimits.rs`: own buckets `auth_qr_start` (5 per 10 s per client IP) and `auth_qr_poll` (20 per 10 s, counted per client IP and per QR id, so polls keep their own budget even when a proxy hides the real IP). The api takes the client IP from `X-Forwarded-For` (`ip_header` in `main.rs`) or `CF-Connecting-IP` (`trust_cloudflare`), so the reverse proxy must set one of them, otherwise all clients share the proxy's IP in the start bucket and in the stored coarse IP. `crates/delta/Cargo.toml` and `Cargo.lock` add `sha2`.
 
-Only the `api` service (`crates/delta`) creates tokens and updates participant permissions. `voice-ingress`, `events` and the others don't, so **only the api image needs replacing**.
+Only the `api` service (`crates/delta`) creates tokens, updates participant permissions and serves the new routes. `voice-ingress`, `events` and the others don't, so **only the api image needs replacing**. The other services run official images and decode the shared models (`crates/core/database`, `crates/core/models`) with upstream's definitions, so a patch must not put new enum variants into anything the api publishes as an event. The events service can't decode them and drops the whole event. New fields on event types are ignored with the default JSON payload format, but break the `msgpack`/`bincode` formats (`REDIS_PAYLOAD_TYPE`). New optional fields that are only stored and served by the api are fine.
 
 ## Images
 
