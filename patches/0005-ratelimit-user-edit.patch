@@ -1,0 +1,15 @@
+diff --git a/crates/delta/src/util/ratelimits.rs b/crates/delta/src/util/ratelimits.rs
+index 45cf325..739b5d9 100644
+--- a/crates/delta/src/util/ratelimits.rs
++++ b/crates/delta/src/util/ratelimits.rs
+@@ -65,7 +65,9 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
+ 
+     fn resolve_bucket_limit(&self, bucket: &str) -> u32 {
+         match bucket {
+-            "user_edit" => 2,
++            // AnyTalk: presence switching hit 429 after 2 changes. The window is a
++            // global 10 s, so 20 allows about 2 changes per second.
++            "user_edit" => 20,
+             "users" => 20,
+             "bots" => 10,
+             "messaging" => 10,
